@@ -262,6 +262,7 @@ export interface CodexDriverOptions {
 export class CodexDriver implements AgentDriver {
   readonly name = "codex";
   readonly hasInbox = true;
+  readonly supportsLiveTurns = false;
   private launch: CodexLaunch | undefined;
   private mcpEntryCache: { at: number; has: boolean } | undefined;
 
@@ -432,7 +433,7 @@ export class CodexDriver implements AgentDriver {
    * tells us the thread has been in a TUI at some point. A held file (rare) is a definite yes;
    * a missing one is a definite no; anything else is unknown and the exec attempt decides.
    */
-  isLive(threadId: string): boolean | undefined {
+  async isLive(threadId: string): Promise<boolean | undefined> {
     const lock = path.join(this.codexHome, "thread-writer-locks", `${threadId}.lock`);
     const held = probeHeldFile(lock);
     if (held === true) return true;

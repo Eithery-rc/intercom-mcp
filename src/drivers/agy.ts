@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { errorMessage, log, tail, truncate } from "../util.js";
+import { AgyRpcClient, STEP, stepText, type CascadeStep } from "./agy-rpc.js";
 import { killTree, probeHeldFile, runCapture } from "./proc.js";
 import type { AgentDriver, HistoryEntry, ThreadInfo, TurnHandle, TurnOutcome, TurnRequest, TurnSummary } from "./types.js";
 
@@ -162,11 +163,15 @@ interface SummaryRow {
 export class AgyDriver implements AgentDriver {
   readonly name = "agy";
   readonly hasInbox = false;
+  /** Live sessions are driven through their local RPC server (see agy-rpc.ts). */
+  readonly supportsLiveTurns = true;
   private launch: AgyLaunch | undefined;
   private readonly home: string;
+  private readonly rpc: AgyRpcClient;
 
   constructor(private readonly opts: AgyDriverOptions) {
     this.home = opts.home ?? process.env.INTERCOM_AGY_HOME ?? path.join(os.homedir(), ".gemini", "antigravity-cli");
+    this.rpc = new AgyRpcClient(this.home);
   }
 
   private getLaunch(): AgyLaunch {
@@ -177,10 +182,107 @@ export class AgyDriver implements AgentDriver {
   describe(): Record<string, unknown> {
     try {
       const l = this.getLaunch();
-      return { binary: l.source, home: this.home, inbox: false, fork: false };
+      return { binary: l.source, home: this.home, inbox: false, fork: false, liveTurns: "local RPC of the running session" };
     } catch (e) {
       return { error: errorMessage(e), home: this.home };
     }
+  }
+
+  /**
+   * Turn inside a running interactive session: the message is posted through the session's own
+   * RPC, shows up in the TUI, runs there, and the reply is read back from the trajectory steps.
+   */
+  private liveTurn(req: TurnRequest, port: number, message: string): TurnHandle {
+    const conversationId = req.agent.threadId as string;
+    const ctl = new AbortController();
+    let cancelled = false;
+    const fresh: CascadeStep[] = [];
+    const summary = (): TurnSummary => {
+      const out: TurnSummary = { finalMessage: null, agentMessages: [], commands: [], fileChanges: [], mcpCalls: [], webSearches: [], errors: [], itemCounts: {} };
+      for (const s of fresh) {
+        const type = (s.type ?? "unknown").replace("CORTEX_STEP_TYPE_", "").toLowerCase();
+        if (s.type === STEP.userInput) continue;
+        out.itemCounts[type] = (out.itemCounts[type] ?? 0) + 1;
+        if (s.type === STEP.plannerResponse) {
+          const text = String(s.plannerResponse?.response ?? "").trim();
+          if (text) {
+            out.agentMessages.push(text);
+            out.finalMessage = text;
+          }
+        } else if (s.type === STEP.error) out.errors.push(stepText(s));
+        else if (/RUN_COMMAND|TERMINAL/i.test(s.type ?? "")) {
+          const p = s[Object.keys(s).find((k) => !["type", "status", "metadata"].includes(k)) ?? ""] ?? {};
+          out.commands.push({ command: String(p.commandLine ?? p.command ?? stepText(s)).slice(0, 300), exitCode: null, status: s.status });
+        }
+      }
+      return out;
+    };
+
+    const done = (async (): Promise<TurnOutcome> => {
+      const eventsOut = fs.createWriteStream(req.files.events, { flags: "a" });
+      const writeEvent = (o: unknown) => eventsOut.write(`${JSON.stringify(o)}\n`);
+      try {
+        log(`agy live turn -> ${conversationId} via port ${port}`);
+        const { stepsBefore } = await this.rpc.sendUserMessage(port, conversationId, message);
+        writeEvent({ event: "live.sent", conversationId, port, stepsBefore });
+        req.onThreadId(conversationId);
+        let stableCount = -1;
+        let stableTicks = 0;
+        for (;;) {
+          if (ctl.signal.aborted) break;
+          await new Promise((r) => setTimeout(r, 2000));
+          if (ctl.signal.aborted) break;
+          let steps: CascadeStep[];
+          try {
+            steps = await this.rpc.steps(port, conversationId, ctl.signal);
+          } catch (e) {
+            if (ctl.signal.aborted) break;
+            throw e;
+          }
+          const current = steps.slice(stepsBefore);
+          for (let i = fresh.length; i < current.length; i++) {
+            fresh.push(current[i]);
+            writeEvent({ event: "step", index: stepsBefore + i, type: current[i].type, status: current[i].status, text: stepText(current[i]).slice(0, 2000) });
+          }
+          for (let i = 0; i < fresh.length; i++) fresh[i] = current[i] ?? fresh[i];
+          const last = current.at(-1);
+          const busy = current.some((s) => s.status && s.status !== STEP.done && !/CANCEL|ERROR/i.test(s.status));
+          const settled = current.length >= 2 && !busy && last && (last.type === STEP.plannerResponse || last.type === STEP.error) && last.status === STEP.done;
+          if (settled) {
+            stableTicks = current.length === stableCount ? stableTicks + 1 : 0;
+            stableCount = current.length;
+            if (stableTicks >= 1) break;
+          } else {
+            stableTicks = 0;
+            stableCount = current.length;
+          }
+        }
+        const sum = summary();
+        if (sum.finalMessage) fs.writeFileSync(req.files.lastMessage, sum.finalMessage);
+        return {
+          ...sum,
+          threadId: conversationId,
+          exitCode: cancelled ? null : sum.errors.length ? 1 : 0,
+          signal: cancelled ? "cancelled" : null,
+          note: `delivered into the live agy session (TUI) through its local RPC on port ${port}; the turn ran there and the reply is shown in that window too`,
+        };
+      } catch (e) {
+        return { ...summary(), threadId: conversationId, exitCode: null, signal: null, spawnError: `live agy turn failed: ${errorMessage(e)}` };
+      } finally {
+        eventsOut.end();
+      }
+    })();
+
+    return {
+      pid: undefined,
+      kill: async () => {
+        cancelled = true;
+        ctl.abort();
+        await this.rpc.cancel(port, conversationId);
+      },
+      done,
+      summary,
+    };
   }
 
   private buildArgs(req: TurnRequest): string[] {
@@ -196,6 +298,39 @@ export class AgyDriver implements AgentDriver {
   }
 
   startTurn(req: TurnRequest): TurnHandle {
+    let message = req.message;
+    if (req.images.length) message += `\n\nAttached files (open them with your tools): ${req.images.join(", ")}`;
+
+    // Resuming a conversation that is open in a running session: go through that session.
+    if (req.mode === "resume" && req.agent.threadId) {
+      const threadId = req.agent.threadId;
+      let inner: TurnHandle | undefined;
+      let killRequested = false;
+      const done = this.rpc.findServerFor(threadId).then((port) => {
+        if (port === undefined) {
+          inner = this.headlessTurn(req, message);
+        } else {
+          inner = this.liveTurn(req, port, message);
+        }
+        if (killRequested) void inner.kill();
+        return inner.done;
+      });
+      return {
+        get pid() {
+          return inner?.pid;
+        },
+        kill: async () => {
+          killRequested = true;
+          await inner?.kill();
+        },
+        done,
+        summary: () => inner?.summary() ?? { finalMessage: null, agentMessages: [], commands: [], fileChanges: [], mcpCalls: [], webSearches: [], errors: [], itemCounts: {} },
+      };
+    }
+    return this.headlessTurn(req, message);
+  }
+
+  private headlessTurn(req: TurnRequest, message: string): TurnHandle {
     const state = new AgyTurnState();
     let child: ChildProcess | undefined;
     let spawnError: string | undefined;
@@ -209,8 +344,6 @@ export class AgyDriver implements AgentDriver {
       } catch (e) {
         return failEarly(errorMessage(e));
       }
-      let message = req.message;
-      if (req.images.length) message += `\n\nAttached files (open them with your tools): ${req.images.join(", ")}`;
       const args = this.buildArgs(req);
       const env = {
         ...process.env,
@@ -278,8 +411,12 @@ export class AgyDriver implements AgentDriver {
     return { ok: false, output: "agy has no message inbox; send the message with agent_send instead" };
   }
 
-  /** An open agy session (TUI or IDE) holds presence/<id>.lock; stale locks stay behind but are not held. */
-  isLive(threadId: string): boolean | undefined {
+  /**
+   * Live = a running session serves this conversation over its local RPC (any platform), or the
+   * presence lock is held by a process (Windows). Stale presence locks stay behind but are not held.
+   */
+  async isLive(threadId: string): Promise<boolean | undefined> {
+    if ((await this.rpc.findServerFor(threadId)) !== undefined) return true;
     const cli = probeHeldFile(path.join(this.home, "presence", `${threadId}.lock`));
     if (cli !== false) return cli;
     return probeHeldFile(path.join(path.dirname(this.home), "antigravity", "presence", `${threadId}.lock`));

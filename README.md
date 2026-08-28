@@ -110,6 +110,27 @@ task_get T-001, review the files, then either:
 First message of a fresh thread gets a generated brief (who the agent is, its workspace, how to
 use the board, "end each turn with a report"). Set `brief` on the agent to replace it.
 
+## Auto-wake: no human relay
+
+An MCP server cannot wake an idle Claude Code session on its own. The supported primitive is a
+background task: the session launches a blocking process and the harness re-invokes the session
+when that process exits. intercom uses it to make a finished agent task wake the session by itself.
+
+```
+agent_send  agent=sprites  message="..."  wait_seconds=0     -> returns job_id + wake_command
+# then, in the SAME session:
+Bash(run_in_background):  <wake_command>
+```
+
+`wake_command` is `node dist/index.js --wait <job_id> --data-dir <dir>`: it blocks until the job
+reaches a terminal state (works for headless jobs and for messages delivered into a live TUI, since
+both write the same job file), prints the result as one JSON line, and exits. That exit wakes the
+session, which reads the result and continues. `agent_send` and `job_wait` also return `wake_command`
+whenever they time out, so a task longer than the ~5 min MCP cap never needs a human to say "it's done".
+
+The job keeps running inside the session's own MCP server process, so the session must stay open
+(idle is fine); if it is closed, the job is orphaned and the waiter reports it on the next server start.
+
 ## Notes and limits
 
 - One turn at a time per agent (Codex locks the thread). `agent_send` refuses while a job runs;
@@ -118,11 +139,10 @@ use the board, "end each turn with a report"). Set `brief` on the agent to repla
   active writer"), so intercom queues the message into that session instead and the job ends as
   `queued_tui`. An idle TUI picks the message up within seconds and answers there; the reply is in
   the thread (`thread_history`), not in the job. Close the TUI to get synchronous answers again.
-- Conversation open in an agy TUI or the Antigravity IDE: agy has no lock and no inbox, a headless
-  turn would silently write into the open conversation behind the session's back. intercom detects
-  the open session (the presence lock is held by the process) and refuses `agent_send`; close the
-  session or use `thread: new`. `agents_list` shows `live_session` per agent (`true`/`false` for
-  agy, `unknown` for Codex, whose lock files are not held).
+- Conversation open in an agy TUI or the Antigravity IDE: intercom detects the running session (it
+  serves the conversation over a local RPC port, logged in `~/.gemini/antigravity-cli/log/cli-*.log`)
+  and drives the turn *through* that session, so the message shows up in the open window, runs there,
+  and the reply comes back to `agent_send`. `agents_list` shows `live_session` per agent.
 - Claude Code aborts an MCP call that is silent for ~5 minutes, so waits are capped at 290 s and
   send progress notifications. Long tasks: `agent_send` returns `still_running`, then `job_wait`.
 - Sandbox defaults to `workspace-write`. `full_auto` passes `--dangerously-bypass-approvals-and-sandbox`.
@@ -138,6 +158,7 @@ use the board, "end each turn with a report"). Set `brief` on the agent to repla
 | thread id | `thread.started` event | `init` event (`conversation_id`) |
 | sandbox | `-s read-only / workspace-write / danger-full-access`; `full_auto` bypasses approvals | `read-only` -> `--mode plan`, `workspace-write` -> `--mode accept-edits`, `danger-full-access` or `full_auto` -> `--dangerously-skip-permissions` |
 | images | `-i file` | no flag; paths are appended to the message for the agent to open |
+| live session (thread open in a TUI/IDE) | message queued into the session inbox (`codex queue`), reply read back from the thread | message posted through the session's local RPC, runs in that window, reply read from its trajectory |
 | `tui_send` | `codex queue --thread` | not available (no inbox) |
 | `thread: fork` | yes | no |
 | history | rollout `.jsonl` under `~/.codex/sessions` | sqlite `~/.gemini/antigravity-cli/conversations/<id>.db` (protobuf payloads, decoded best-effort) |

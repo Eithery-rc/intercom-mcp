@@ -43,6 +43,8 @@ export interface TurnOutcome extends TurnSummary {
   exitCode: number | null;
   signal: string | null;
   spawnError?: string;
+  /** Driver remark surfaced on the job (e.g. "delivered into the live session"). */
+  note?: string;
 }
 
 export interface TurnHandle {
@@ -75,11 +77,13 @@ export interface AgentDriver {
   readonly name: string;
   /** Whether queueMessage can deliver into a running interactive session. */
   readonly hasInbox: boolean;
+  /** Whether startTurn itself can run a turn inside a running interactive session (and return the reply). */
+  readonly supportsLiveTurns: boolean;
   startTurn(req: TurnRequest): TurnHandle;
   /** Drop a message into the agent's inbox; delivered on the thread's next turn (TUI or headless). */
   queueMessage(threadRef: string, message: string, images: string[]): Promise<{ ok: boolean; output: string }>;
   /** true = an interactive session currently holds this thread; undefined = cannot tell. */
-  isLive(threadId: string): boolean | undefined;
+  isLive(threadId: string): Promise<boolean | undefined>;
   threadHistory(threadId: string, last: number): Promise<HistoryEntry[]>;
   recentThreads(limit: number, cwdFilter?: string): Promise<ThreadInfo[]>;
   describe(): Record<string, unknown>;

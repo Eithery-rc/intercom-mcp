@@ -13,6 +13,8 @@ export interface ServerDeps {
   jobs: JobManager;
   tasks: TaskBoard;
   drivers: Record<string, AgentDriver>;
+  /** Absolute path of this server's entry script, for building the background wake command. */
+  entry: string;
 }
 
 /** Claude Code aborts an MCP call that stays silent for ~5 minutes; keep waits under that. */
@@ -78,15 +80,24 @@ function presentJob(j: JobRecord, opts: { full?: boolean; progress?: TurnSummary
   };
 }
 
-const INSTRUCTIONS = `intercom: drive other coding agents (Codex today, Antigravity next) from this session.
-Workflow: agent_upsert (once per agent, gives it a cwd and role) -> agent_send (a task; waits up to wait_seconds and returns the agent's final message) -> job_wait if still running -> review, then reply on the same thread with agent_send again. Threads persist on disk; the human can open the same conversation in the Codex TUI with \`codex resume <thread_id>\`.
-tui_send drops a message into a thread's inbox without running it: Codex reads it at the start of its next turn, in the TUI or in the next agent_send.
-The task board (task_*) is shared with the agents: they see and update their tasks from inside their own sessions.`;
+const INSTRUCTIONS = `intercom: drive other coding agents (Codex and Antigravity/agy) from this session.
+Workflow: agent_upsert (once per agent: cwd and role) -> agent_send (a task; waits up to wait_seconds and returns the agent's final message) -> job_wait if still running -> review, then reply on the same thread with agent_send again. Threads persist on disk; the human can open the same conversation in the agent's TUI (\`codex resume <id>\` / \`agy --conversation <id>\`), and intercom keeps using it.
+If a thread is open in a live interactive session, agent_send still works: for Codex the message goes through the session inbox, for agy through the session's local RPC, and the job returns the reply once the session answers there.
+AUTO-WAKE (no human relay): for a long task, call agent_send with wait_seconds:0, then run the returned wake_command via Bash run_in_background. It blocks until the job finishes and its exit wakes this session with the result. Use this instead of asking the human to tell you when the agent is done. On a wait timeout, agent_send/job_wait return the same wake_command.
+tui_send drops a message into a Codex thread's inbox without running it (no reply expected).
+The task board (task_*) is shared with the agents: they see and update their own tasks from inside their sessions.`;
 
 export function buildServer(deps: ServerDeps): McpServer {
-  const { cfg, registry, jobs, tasks, drivers } = deps;
+  const { cfg, registry, jobs, tasks, drivers, entry } = deps;
   const server = new McpServer({ name: "intercom", version: cfg.version }, { instructions: cfg.role === "orchestrator" ? INSTRUCTIONS : undefined });
   const isOrchestrator = cfg.role === "orchestrator";
+
+  // Forward slashes so the command runs in both git-bash and PowerShell on Windows (node accepts them).
+  const slash = (s: string) => s.replace(/\\/g, "/");
+  const q = (s: string) => (/[\s"]/.test(s) ? `"${slash(s).replace(/"/g, '\\"')}"` : slash(s));
+  // Command Claude runs via Bash run_in_background: it blocks until the job finishes, and its exit
+  // wakes the session. This is how a finished task notifies the session without a human relay.
+  const wakeCommand = (jobId: string) => `${q(process.execPath)} ${q(entry)} --wait ${jobId} --data-dir ${q(cfg.dataDir)}`;
 
   server.registerTool(
     "info",
@@ -137,7 +148,7 @@ export function buildServer(deps: ServerDeps): McpServer {
           add_dirs: a.addDirs,
           thread_id: a.threadId,
           thread_name: a.threadName,
-          live_session: a.threadId ? (drivers[a.driver]?.isLive(a.threadId) ?? "unknown") : false,
+          live_session: a.threadId ? ((await drivers[a.driver]?.isLive(a.threadId)) ?? "unknown") : false,
           turns: a.turns,
           running_job: running ? { job_id: running.id, since: running.startedAt } : null,
           last_job: last ? { job_id: last.id, status: last.status, finished_at: last.finishedAt, final_message: truncate(last.result?.finalMessage ?? "", 300) || null } : null,
@@ -311,9 +322,9 @@ export function buildServer(deps: ServerDeps): McpServer {
     });
     const progress = timedOut ? jobs.progress(jobId) : undefined;
     let hint: string | undefined;
-    if (timedOut) hint = `call job_wait with job_id ${jobId} to keep waiting`;
-    else if (job.status === "queued_tui") hint = "delivered to the agent's live interactive session; no reply comes back through this job. Check thread_history later or ask the human.";
-    return { ...presentJob(job, { progress }), still_running: timedOut, hint };
+    if (timedOut) hint = `still running. To be woken automatically when it finishes instead of polling, run this via Bash run_in_background: ${wakeCommand(jobId)} . Or call job_wait again with job_id ${jobId}.`;
+    else if (job.note) hint = job.note;
+    return { ...presentJob(job, { progress }), still_running: timedOut, wake_command: timedOut ? wakeCommand(jobId) : undefined, hint };
   };
 
   server.registerTool(
@@ -321,7 +332,7 @@ export function buildServer(deps: ServerDeps): McpServer {
     {
       title: "Send a message to an agent",
       description:
-        "Send a task or reply to an agent on its persistent thread and (optionally) wait for the answer. Returns the agent's final message plus a summary of commands and file changes. thread='new' starts a fresh conversation, 'fork' branches the current one. Use task_id to link the run to a board task. If the thread is currently open in an interactive session (human in the TUI), the message is queued into that session instead and the job ends as queued_tui.",
+        "Send a task or reply to an agent on its persistent thread and (optionally) wait for the answer. Returns the agent's final message plus a summary of commands and file changes. thread='new' starts a fresh conversation, 'fork' branches the current one. Use task_id to link the run to a board task. If the thread is currently open in an interactive session (human in the TUI), the message is delivered into that session instead (Codex: inbox, agy: local RPC) and the job returns the session's reply once it answers there.",
       inputSchema: {
         agent: z.string(),
         message: z.string().min(1),
@@ -348,7 +359,12 @@ export function buildServer(deps: ServerDeps): McpServer {
         }
       }
       const wait = wait_seconds ?? 240;
-      if (wait <= 0) return ok({ ...presentJob(job), hint: `job started; call job_wait with job_id ${job.id}` });
+      if (wait <= 0)
+        return ok({
+          ...presentJob(job),
+          wake_command: wakeCommand(job.id),
+          hint: `job started in the background. To be woken automatically when it finishes, run this via Bash run_in_background: ${wakeCommand(job.id)} . Or poll with job_wait job_id ${job.id}.`,
+        });
       try {
         return ok(await waitFor(job.id, wait, extra));
       } catch (e) {

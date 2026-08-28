@@ -3,6 +3,7 @@
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -53,6 +54,25 @@ if (useCodex) {
   await call("job_list", { limit: 5 });
   await call("job_events", { job_id: second.job_id, last: 5 });
   await call("task_get", { id: task.id });
+
+  // Auto-wake: fire-and-forget, then run the wake_command as a separate process (as Claude would
+  // via Bash run_in_background). The server stays alive on THIS client, so the job runs to completion
+  // and the waiter exits with the result. The waiter's exit is what wakes a real session.
+  const bg = await call("agent_send", { agent: "smoke", message: "Reply with exactly the word DONE and nothing else.", wait_seconds: 0 });
+  if (!bg.wake_command) throw new Error("no wake_command returned for wait_seconds:0");
+  console.log("wake_command:", bg.wake_command);
+  const waiter = await new Promise((resolve) => {
+    const child = spawn(bg.wake_command, { shell: true });
+    let out = "";
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => process.stderr.write(`  [waiter] ${d}`));
+    child.on("exit", (code) => resolve({ code, out: out.trim() }));
+  });
+  console.log(`waiter exit=${waiter.code} out=${waiter.out}`);
+  const waited = JSON.parse(waiter.out);
+  if (waiter.code !== 0 || waited.status !== "succeeded" || !/DONE/.test(waited.final_message ?? "")) {
+    throw new Error(`auto-wake failed: exit ${waiter.code}, ${waiter.out}`);
+  }
 
   // Reverse channel: Codex must see the same board through its own intercom MCP (worker role).
   const info = await call("info");
