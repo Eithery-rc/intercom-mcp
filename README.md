@@ -91,7 +91,9 @@ Orchestrator (Claude Code):
 | `tui_send` | `codex queue` a message into a thread (by agent, uuid, or session name) |
 | `task_create`, `task_update`, `task_list`, `task_get` | shared board |
 
-Worker (inside Codex): `info`, `agents_list`, `task_*` only.
+| `inbox` | read the reverse channel (worker notifications) and get a `listen_command` |
+
+Worker (inside Codex/agy): `info`, `agents_list`, `task_*`, and `notify` (ping the orchestrator).
 
 ## Typical session
 
@@ -130,6 +132,24 @@ whenever they time out, so a task longer than the ~5 min MCP cap never needs a h
 
 The job keeps running inside the session's own MCP server process, so the session must stay open
 (idle is fine); if it is closed, the job is orphaned and the waiter reports it on the next server start.
+
+## Reverse channel: an agent pinging the orchestrator
+
+Agents reach the orchestrator without it asking. From inside its session an agent calls `notify`
+(and automatically when it sets a task to `review`/`blocked`), which posts to a shared inbox. The
+orchestrator reads it with the `inbox` tool, and arms a listener the same way as auto-wake:
+
+```
+inbox                                    -> entries + a listen_command
+Bash(run_in_background):  <listen_command>   # blocks until an agent posts, then exits and wakes the session
+# after handling, re-arm with the new cursor:
+inbox { since: <cursor> }  -> new listen_command
+```
+
+So both directions are covered with the same background-task primitive: `wake_command` for "the
+task I sent finished", `listen_command` for "an agent has something to tell me". Neither needs a
+human relay. Worker-role agents get `notify` in addition to the task board; the inbox lives in
+`.intercom/inbox.json`.
 
 ## Notes and limits
 

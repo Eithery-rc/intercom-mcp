@@ -77,6 +77,25 @@ if (useCodex) {
   // Reverse channel: Codex must see the same board through its own intercom MCP (worker role).
   const info = await call("info");
   if (info.drivers?.codex?.workerMcpConfigured) {
+    // A standing inbox listener wakes when the worker posts (as Claude would run it via Bash
+    // run_in_background). Arm it, then have Codex call notify from inside its turn.
+    const inbox0 = await call("inbox", {});
+    const listener = new Promise((resolve) => {
+      const child = spawn(inbox0.listen_command, { shell: true });
+      let out = "";
+      child.stdout.on("data", (d) => (out += d));
+      child.stderr.on("data", (d) => process.stderr.write(`  [listener] ${d}`));
+      child.on("exit", (code) => resolve({ code, out: out.trim() }));
+    });
+    const ping = await call("agent_send", { agent: "smoke", message: 'Call the intercom MCP tool "notify" with text "smoke ping from codex" and kind "note". Then reply with exactly: pinged.', wait_seconds: 240 });
+    if (!/pinged/i.test(ping.final_message ?? "")) throw new Error(`notify turn did not confirm: ${ping.final_message}`);
+    const woke = await listener;
+    console.log(`listener exit=${woke.code} out=${woke.out}`);
+    const wokeData = JSON.parse(woke.out);
+    if (woke.code !== 0 || !wokeData.entries?.some((e) => /smoke ping from codex/.test(e.text))) {
+      throw new Error(`reverse channel failed: ${woke.out}`);
+    }
+
     const third = await call("agent_send", {
       agent: "smoke",
       message: `Call the intercom MCP tool "info", then call "task_update" for task ${task.id} with status "review" and result "checked from codex". Reply with one line: role=<role> data_dir=<data_dir> actor=<actor> copied from the info result.`,

@@ -5,6 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { VERSION, loadConfig, parseArgs } from "./config.js";
 import { AgyDriver } from "./drivers/agy.js";
 import { CodexDriver } from "./drivers/codex.js";
+import { Inbox } from "./inbox.js";
 import { JobManager, waitForJobFile } from "./jobs.js";
 import { Registry } from "./registry.js";
 import { buildServer } from "./server.js";
@@ -18,6 +19,9 @@ MCP server (stdio) that drives Codex and Antigravity sessions from Claude Code.
   intercom-mcp --doctor              print resolved configuration and exit
   intercom-mcp --wait JOB_ID         block until a job finishes, print the result, exit
                                      (run via Bash run_in_background to wake the session on completion)
+  intercom-mcp --wait-inbox [--since N]
+                                     block until a worker posts to the inbox, print it, exit
+                                     (the reverse channel: lets an agent wake this session)
   intercom-mcp --version
 
 Env: INTERCOM_DIR, INTERCOM_ROLE, INTERCOM_ACTOR, INTERCOM_AGENT, INTERCOM_CODEX, INTERCOM_AGY, CODEX_HOME
@@ -59,11 +63,21 @@ async function main(): Promise<void> {
     );
     process.exit(timedOut ? 3 : job.status === "succeeded" ? 0 : 1);
   }
+
+  if (args["wait-inbox"] !== undefined) {
+    const inbox = new Inbox(path.join(cfg.dataDir, "inbox.json"));
+    const since = Number(args.since ?? 0);
+    const timeoutSec = Number(args.timeout ?? 3600);
+    const { entries, cursor, timedOut } = await inbox.waitForNew(since, timeoutSec);
+    process.stdout.write(`${JSON.stringify({ entries, cursor, timed_out: timedOut })}\n`);
+    process.exit(timedOut ? 3 : 0);
+  }
   const registry = new Registry(path.join(cfg.dataDir, "agents.json"));
   const tasks = new TaskBoard(path.join(cfg.dataDir, "tasks.json"), path.join(cfg.dataDir, "TASKS.md"));
   const codex = new CodexDriver(cfg.codexHome, { dataDir: cfg.dataDir, workerMcpName: "intercom" });
   const agy = new AgyDriver({ dataDir: cfg.dataDir });
   const drivers = { codex, agy };
+  const inbox = new Inbox(path.join(cfg.dataDir, "inbox.json"));
   const jobs = new JobManager(path.join(cfg.dataDir, "jobs"), registry, drivers, cfg.actor, {
     onFinished: async (job) => {
       if (!job.taskId) return;
@@ -100,7 +114,7 @@ async function main(): Promise<void> {
   if (orphans.length) log(`marked orphaned jobs as failed: ${orphans.join(", ")}`);
 
   const entry = fileURLToPath(import.meta.url);
-  const server = buildServer({ cfg, registry, jobs, tasks, drivers, entry });
+  const server = buildServer({ cfg, registry, jobs, tasks, inbox, drivers, entry });
   const transport = new StdioServerTransport();
   await server.connect(transport);
   log(`ready v${cfg.version} role=${cfg.role} actor=${cfg.actor} data=${cfg.dataDir} (${cfg.dataDirSource})`);

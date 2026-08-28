@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { IntercomConfig } from "./config.js";
 import type { AgentDriver, TurnSummary } from "./drivers/types.js";
+import type { Inbox } from "./inbox.js";
 import type { JobManager, JobRecord } from "./jobs.js";
 import type { Registry } from "./registry.js";
 import type { TaskBoard } from "./tasks.js";
@@ -12,6 +13,7 @@ export interface ServerDeps {
   registry: Registry;
   jobs: JobManager;
   tasks: TaskBoard;
+  inbox: Inbox;
   drivers: Record<string, AgentDriver>;
   /** Absolute path of this server's entry script, for building the background wake command. */
   entry: string;
@@ -85,10 +87,11 @@ Workflow: agent_upsert (once per agent: cwd and role) -> agent_send (a task; wai
 If a thread is open in a live interactive session, agent_send still works: for Codex the message goes through the session inbox, for agy through the session's local RPC, and the job returns the reply once the session answers there.
 AUTO-WAKE (no human relay): for a long task, call agent_send with wait_seconds:0, then run the returned wake_command via Bash run_in_background. It blocks until the job finishes and its exit wakes this session with the result. Use this instead of asking the human to tell you when the agent is done. On a wait timeout, agent_send/job_wait return the same wake_command.
 tui_send drops a message into a Codex thread's inbox without running it (no reply expected).
-The task board (task_*) is shared with the agents: they see and update their own tasks from inside their sessions.`;
+The task board (task_*) is shared with the agents: they see and update their own tasks from inside their sessions.
+REVERSE CHANNEL: agents can reach you without you asking. They post to your inbox (the notify tool, and automatically when they set a task to review/blocked). Read it with the inbox tool; to be woken when an agent pings you next, run the inbox tool's listen_command via Bash run_in_background (it blocks until a new message arrives and its exit wakes this session), then re-arm it with the new cursor. This is the counterpart of auto-wake: use both and neither direction needs a human relay.`;
 
 export function buildServer(deps: ServerDeps): McpServer {
-  const { cfg, registry, jobs, tasks, drivers, entry } = deps;
+  const { cfg, registry, jobs, tasks, inbox, drivers, entry } = deps;
   const server = new McpServer({ name: "intercom", version: cfg.version }, { instructions: cfg.role === "orchestrator" ? INSTRUCTIONS : undefined });
   const isOrchestrator = cfg.role === "orchestrator";
 
@@ -98,6 +101,8 @@ export function buildServer(deps: ServerDeps): McpServer {
   // Command Claude runs via Bash run_in_background: it blocks until the job finishes, and its exit
   // wakes the session. This is how a finished task notifies the session without a human relay.
   const wakeCommand = (jobId: string) => `${q(process.execPath)} ${q(entry)} --wait ${jobId} --data-dir ${q(cfg.dataDir)}`;
+  // Standing listener for the reverse channel: blocks until a worker posts to the inbox, then exits.
+  const listenCommand = (cursor: number) => `${q(process.execPath)} ${q(entry)} --wait-inbox --since ${cursor} --data-dir ${q(cfg.dataDir)}`;
 
   server.registerTool(
     "info",
@@ -247,7 +252,36 @@ export function buildServer(deps: ServerDeps): McpServer {
     },
     async ({ id, actor, ...patch }) => {
       try {
-        return ok(await tasks.update(id, patch, actor ?? cfg.actor));
+        const author = actor ?? cfg.actor;
+        const updated = await tasks.update(id, patch, author);
+        // A worker moving a task to review/blocked pings the orchestrator's inbox automatically.
+        if (cfg.role === "worker" && (patch.status === "review" || patch.status === "blocked")) {
+          await inbox.post({ from: author, kind: patch.status, taskId: id, text: `${id} ${patch.status}: ${patch.result ?? patch.note ?? updated.title}` });
+        }
+        return ok(updated);
+      } catch (e) {
+        return fail(errorMessage(e));
+      }
+    },
+  );
+
+  server.registerTool(
+    "notify",
+    {
+      title: "Notify the orchestrator",
+      description:
+        "Send a message to the orchestrator's inbox (the reverse channel). Use this to ping Claude when you finish something it is not actively waiting on, hit a blocker, or need an answer mid-task. If the orchestrator has a listener running, this wakes its session; otherwise it reads the inbox on its next check. Setting a task to review/blocked already notifies automatically, so use notify for questions, progress, or work not tied to a task.",
+      inputSchema: {
+        text: z.string().min(1),
+        kind: z.enum(["note", "question", "progress", "done", "blocked"]).optional().describe("default note"),
+        task_id: z.string().optional(),
+        from: z.string().optional().describe("override the sender name (defaults to this agent)"),
+      },
+    },
+    async ({ text, kind, task_id, from }) => {
+      try {
+        const entry = await inbox.post({ from: from ?? cfg.actor, kind, text, taskId: task_id });
+        return ok({ posted: true, seq: entry.seq });
       } catch (e) {
         return fail(errorMessage(e));
       }
@@ -255,6 +289,23 @@ export function buildServer(deps: ServerDeps): McpServer {
   );
 
   if (!isOrchestrator) return server;
+
+  server.registerTool(
+    "inbox",
+    {
+      title: "Read the inbox",
+      description:
+        "Read messages workers have posted to the reverse channel (task review/blocked notifications, questions, progress). Returns entries since `since` (0 = all kept) and a listen_command. To be woken when a worker pings you next, run listen_command via Bash run_in_background: it blocks until a new message arrives, then its exit wakes this session. Re-arm it with the returned cursor after handling messages.",
+      inputSchema: {
+        since: z.number().int().min(0).optional().describe("only entries with seq greater than this; default 0"),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ since }) => {
+      const { entries, cursor } = await inbox.read(since ?? 0);
+      return ok({ entries, cursor, listen_command: listenCommand(cursor) });
+    },
+  );
 
   // ---- orchestrator only ----------------------------------------------------------------------
 

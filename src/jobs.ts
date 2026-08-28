@@ -82,7 +82,7 @@ export function defaultBrief(agent: AgentRecord, orchestrator: string): string {
     `[intercom] You are agent "${agent.name}", a worker on a multi-agent team. The orchestrator ("${orchestrator}", running in Claude Code) sends you tasks through this thread and reads only the final message of each of your turns.`,
     agent.role ? `Role: ${agent.role}` : "",
     `Workspace: ${agent.cwd}${extraDirs}. Stay inside it.`,
-    `Coordination tools (MCP server "intercom", when available): task_list, task_get, task_update, task_create. Use actor "${agent.name}". When you finish a task set its status to "review" with a short result; if you cannot proceed set "blocked" and say why. Never mark tasks "done" yourself: the orchestrator does that after review.`,
+    `Coordination tools (MCP server "intercom", when available): task_list, task_get, task_update, task_create, notify. Use actor "${agent.name}". When you finish a task set its status to "review" with a short result; if you cannot proceed set "blocked" and say why. Never mark tasks "done" yourself: the orchestrator does that after review. Setting review/blocked already pings the orchestrator; use notify to reach it otherwise (a question mid-task, progress, or work not tied to a task).`,
     `End every turn with a concise report: what changed (paths), decisions made, open questions. If the task is ambiguous, ask in the final message instead of guessing. Do not wait for a human: the orchestrator is your counterpart.`,
   ]
     .filter(Boolean)
